@@ -1,22 +1,213 @@
-name: Windows - RustDesk
+```yaml
+name: Windows - noVNC
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Start Building...
+    name: Windows Desktop + noVNC
     runs-on: windows-latest
-    timeout-minutes: 99999999999999999999999999999
-    
+    timeout-minutes: 360
+
     steps:
+
       - name: Downloading & Installing Essentials
+        shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://www.dropbox.com/scl/fi/qdyd4p9t6xoabl95n5o3g/Downloads.bat?rlkey=snr74vv1vr8k5suujugvrhjtm&dl=1" -OutFile "Downloads.bat"
+          Invoke-WebRequest `
+            -Uri "https://www.dropbox.com/scl/fi/qdyd4p9t6xoabl95n5o3g/Downloads.bat?rlkey=snr74vv1vr8k5suujugvrhjtm&dl=1" `
+            -OutFile "Downloads.bat"
+
           cmd /c Downloads.bat
 
-      - name: Log In To AnyDesk
-        run: cmd /c show.bat
+      - name: Install TightVNC
+        shell: powershell
+        run: |
+          Write-Host "[+] Installing TightVNC..."
 
-      - name: Time Counter
-        run: python time.py
+          choco install tightvnc -y --no-progress
+
+          Write-Host "[+] TightVNC installed."
+
+      - name: Configure and Start VNC
+        shell: powershell
+        run: |
+          $vnc = Get-ChildItem `
+            "C:\Program Files\TightVNC" `
+            -Filter "tvnserver.exe" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $vnc) {
+            throw "TightVNC server executable was not found."
+          }
+
+          Write-Host "[+] VNC executable:"
+          Write-Host $vnc.FullName
+
+          # Start TightVNC in service mode
+          & $vnc.FullName -install -silent
+
+          Start-Sleep -Seconds 2
+
+          & $vnc.FullName -start -silent
+
+          Start-Sleep -Seconds 5
+
+          Write-Host "[+] Checking port 5900..."
+
+          $connection = Get-NetTCPConnection `
+            -LocalPort 5900 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $connection) {
+            Write-Host "[!] Port 5900 was not detected yet."
+            Write-Host "[!] Showing VNC processes:"
+            Get-Process | Where-Object {
+              $_.ProcessName -match "tvn|winvnc"
+            }
+          }
+          else {
+            Write-Host "[+] VNC is listening on port 5900."
+          }
+
+      - name: Install noVNC
+        shell: powershell
+        run: |
+          Write-Host "[+] Downloading noVNC..."
+
+          git clone --depth 1 https://github.com/novnc/noVNC.git C:\noVNC
+
+          python -m pip install --upgrade pip
+          python -m pip install websockify
+
+          Write-Host "[+] noVNC installed."
+
+      - name: Start noVNC
+        shell: powershell
+        run: |
+          Write-Host "[+] Starting noVNC..."
+
+          Start-Process `
+            -FilePath "python" `
+            -ArgumentList @(
+              "C:\noVNC\utils\websockify\websockify.py",
+              "--web",
+              "C:\noVNC",
+              "6080",
+              "localhost:5900"
+            ) `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 5
+
+          $connection = Get-NetTCPConnection `
+            -LocalPort 6080 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $connection) {
+            throw "noVNC failed to start on port 6080."
+          }
+
+          Write-Host "[+] noVNC is listening on port 6080."
+
+      - name: Install Cloudflare Tunnel
+        shell: powershell
+        run: |
+          Write-Host "[+] Installing cloudflared..."
+
+          choco install cloudflared -y --no-progress
+
+          Write-Host "[+] cloudflared installed."
+
+      - name: Start Public noVNC Tunnel
+        shell: powershell
+        run: |
+          Write-Host "[+] Starting temporary tunnel..."
+          Write-Host ""
+
+          Start-Process `
+            -FilePath "cloudflared" `
+            -ArgumentList @(
+              "tunnel",
+              "--url",
+              "http://127.0.0.1:6080"
+            ) `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\cloudflared.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\cloudflared-error.log" `
+            -WindowStyle Hidden
+
+          Write-Host "[+] Waiting for tunnel URL..."
+
+          $url = $null
+
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 2
+
+            if (Test-Path "$env:RUNNER_TEMP\cloudflared.log") {
+              $log = Get-Content "$env:RUNNER_TEMP\cloudflared.log" -Raw
+
+              $match = [regex]::Match(
+                $log,
+                'https://[a-zA-Z0-9.-]+\.trycloudflare\.com'
+              )
+
+              if ($match.Success) {
+                $url = $match.Value
+                break
+              }
+            }
+
+            Write-Host "Waiting... $i/30"
+          }
+
+          if (-not $url) {
+            Write-Host "===== cloudflared output ====="
+            if (Test-Path "$env:RUNNER_TEMP\cloudflared.log") {
+              Get-Content "$env:RUNNER_TEMP\cloudflared.log"
+            }
+
+            Write-Host "===== cloudflared errors ====="
+            if (Test-Path "$env:RUNNER_TEMP\cloudflared-error.log") {
+              Get-Content "$env:RUNNER_TEMP\cloudflared-error.log"
+            }
+
+            throw "Could not obtain Cloudflare tunnel URL."
+          }
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "          WINDOWS noVNC IS READY"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Open this URL:"
+          Write-Host "$url/vnc.html"
+          Write-Host ""
+          Write-Host "VNC port: 5900"
+          Write-Host "noVNC port: 6080"
+          Write-Host "=============================================="
+
+      - name: Log In To AnyDesk
+        shell: cmd
+        run: |
+          if exist show.bat (
+            cmd /c show.bat
+          ) else (
+            echo show.bat was not found - skipping.
+          )
+
+      - name: Keep Windows Desktop Alive
+        shell: powershell
+        run: |
+          Write-Host "[+] Windows desktop + VNC + noVNC are running."
+          Write-Host "[+] Keeping runner alive..."
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] noVNC is still running..."
+            Start-Sleep -Seconds 60
+          }
+```
